@@ -1,6 +1,12 @@
-import { Client, Events, GatewayIntentBits, Message, TextChannel } from 'discord.js';
+import {
+  Client,
+  Events,
+  GatewayIntentBits,
+  Message,
+  TextChannel,
+} from 'discord.js';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { ASSISTANT_NAME, TRIGGER_PATTERN, DISCORD_WEBHOOK_URLS } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
@@ -15,6 +21,57 @@ export interface DiscordChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+}
+
+/**
+ * Send a message via a Discord webhook with a custom username (sender identity).
+ * One webhook per channel supports unlimited agent identities — the username
+ * field is set dynamically per POST, so no bot pool is needed.
+ */
+export async function sendWebhookMessage(
+  channelJid: string,
+  text: string,
+  senderName: string,
+): Promise<void> {
+  const channelId = channelJid.replace(/^dc:/, '');
+  const webhookUrl = DISCORD_WEBHOOK_URLS[channelId];
+
+  if (!webhookUrl) {
+    logger.warn(
+      { channelJid },
+      'No webhook URL configured for channel — skipping swarm message',
+    );
+    return;
+  }
+
+  const MAX_LENGTH = 2000;
+  const chunks: string[] = [];
+  for (let i = 0; i < text.length; i += MAX_LENGTH) {
+    chunks.push(text.slice(i, i + MAX_LENGTH));
+  }
+
+  for (const chunk of chunks) {
+    try {
+      const res = await fetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: chunk, username: senderName }),
+      });
+      if (!res.ok) {
+        logger.error(
+          { channelJid, senderName, status: res.status },
+          'Webhook POST failed',
+        );
+      }
+    } catch (err) {
+      logger.error({ channelJid, senderName, err }, 'Failed to send webhook message');
+    }
+  }
+
+  logger.info(
+    { channelJid, senderName, chunks: chunks.length },
+    'Discord webhook message sent',
+  );
 }
 
 export class DiscordChannel implements Channel {
@@ -88,18 +145,20 @@ export class DiscordChannel implements Channel {
 
       // Handle attachments — store placeholders so the agent knows something was sent
       if (message.attachments.size > 0) {
-        const attachmentDescriptions = [...message.attachments.values()].map((att) => {
-          const contentType = att.contentType || '';
-          if (contentType.startsWith('image/')) {
-            return `[Image: ${att.name || 'image'}]`;
-          } else if (contentType.startsWith('video/')) {
-            return `[Video: ${att.name || 'video'}]`;
-          } else if (contentType.startsWith('audio/')) {
-            return `[Audio: ${att.name || 'audio'}]`;
-          } else {
-            return `[File: ${att.name || 'file'}]`;
-          }
-        });
+        const attachmentDescriptions = [...message.attachments.values()].map(
+          (att) => {
+            const contentType = att.contentType || '';
+            if (contentType.startsWith('image/')) {
+              return `[Image: ${att.name || 'image'}]`;
+            } else if (contentType.startsWith('video/')) {
+              return `[Video: ${att.name || 'video'}]`;
+            } else if (contentType.startsWith('audio/')) {
+              return `[Audio: ${att.name || 'audio'}]`;
+            } else {
+              return `[File: ${att.name || 'file'}]`;
+            }
+          },
+        );
         if (content) {
           content = `${content}\n${attachmentDescriptions.join('\n')}`;
         } else {
@@ -125,7 +184,13 @@ export class DiscordChannel implements Channel {
 
       // Store chat metadata for discovery
       const isGroup = message.guild !== null;
-      this.opts.onChatMetadata(chatJid, timestamp, chatName, 'discord', isGroup);
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        chatName,
+        'discord',
+        isGroup,
+      );
 
       // Only deliver full message for registered groups
       const group = this.opts.registeredGroups()[chatJid];
